@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CryptoTeller - Real-Time Crypto Prices</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Chart.js for graphs -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    
+    <!-- Google Fonts: Inter -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- Custom Styles -->
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #0D1117;
+        }
+
+        /* --- Subtle Card Hover Effect --- */
+        .glow-card {
+            background-color: #161B22;
+            border: 1px solid #30363d;
+            transition: transform 0.3s ease, border-color 0.3s ease, background-color 0.3s ease;
+        }
+
+        .glow-card:hover {
+             border-color: #374151;
+             background-color: #1F2937;
+        }
+        
+        /* Custom Scrollbar */
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: rgba(0, 0, 0, 0.2); border-radius: 10px; }
+        ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.3); border-radius: 10px; }
+        ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.5); }
+
+        /* --- Modal Animation --- */
+        #modal-container {
+            transition: opacity 0.3s ease;
+        }
+        #modal-container.hidden {
+            opacity: 0;
+            pointer-events: none; /* prevent interaction when hidden */
+        }
+        #modal-content {
+            transition: transform 0.3s ease, opacity 0.3s ease;
+        }
+        #modal-container.hidden #modal-content {
+            transform: scale(0.95);
+            opacity: 0;
+        }
+
+        /* --- Card Load Animation --- */
+        @keyframes card-enter {
+            from {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        .card-enter-animation {
+            animation: card-enter 0.5s ease forwards;
+        }
+    </style>
+</head>
+<body class="text-white">
+
+    <div class="container mx-auto p-4 md:p-8">
+        <!-- Header -->
+        <header class="text-center mb-8">
+            <a href="https://t.me/crypteller_bot" target="_blank" rel="noopener noreferrer">
+                 <h1 class="text-4xl md:text-5xl font-bold tracking-tight hover:opacity-80 transition-opacity">CryptoTeller</h1>
+            </a>
+            <p class="text-lg text-gray-400 mt-2">Powered by <span class="font-semibold text-transparent bg-clip-text bg-gradient-to-r from-red-500 via-green-500 to-blue-500">RGB.Development</span></p>
+        </header>
+
+        <!-- Search and Controls -->
+        <div class="mb-8">
+            <div class="relative max-w-lg mx-auto">
+                 <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                    <svg class="h-5 w-5 text-gray-400" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M8 4a4 4 0 100 8 4 4 0 000-8zM2 8a6 6 0 1110.89 3.476l4.817 4.817a1 1 0 01-1.414 1.414l-4.816-4.816A6 6 0 012 8z" clip-rule="evenodd" /></svg>
+                </div>
+                <input type="text" id="search-input" placeholder="Search any cryptocurrency..." class="w-full bg-[#161B22] border border-gray-700 rounded-lg py-3 pl-10 pr-4 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition duration-300">
+            </div>
+        </div>
+
+        <!-- Crypto Grid -->
+        <main id="crypto-grid" class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
+            <div id="loading-spinner" class="col-span-full flex justify-center items-center h-64">
+                <svg class="animate-spin -ml-1 mr-3 h-10 w-10 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                <span class="text-xl">Loading data...</span>
+            </div>
+        </main>
+        
+        <!-- Footer -->
+        <footer class="text-center mt-12 text-gray-400">
+            <p>Data provided by <a href="https://www.coingecko.com/" target="_blank" rel="noopener noreferrer" class="hover:text-green-400 underline">CoinGecko</a>.</p>
+            <p class="mt-2">Check out the <a href="https://github.com/RGB-Outl4w/CryptoTeller" target="_blank" rel="noopener noreferrer" class="hover:text-blue-400 underline">official repository</a>.</p>
+        </footer>
+    </div>
+    
+    <!-- Modal for Focused View -->
+    <div id="modal-container" class="hidden fixed inset-0 bg-black bg-opacity-70 z-50 flex justify-center items-center p-4">
+        <div id="modal-content" class="glow-card rounded-xl w-full max-w-2xl p-6 relative">
+            <button id="modal-close" class="absolute top-4 right-4 text-gray-400 hover:text-white hover:scale-110 transition-transform">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" /></svg>
+            </button>
+            <div id="modal-body"></div>
+        </div>
+    </div>
+
+
+    <script>
+        // --- DOM Elements ---
+        const cryptoGrid = document.getElementById('crypto-grid');
+        const searchInput = document.getElementById('search-input');
+        const loadingSpinner = document.getElementById('loading-spinner');
+        const modalContainer = document.getElementById('modal-container');
+        const modalContent = document.getElementById('modal-content');
+        const modalBody = document.getElementById('modal-body');
+        const modalClose = document.getElementById('modal-close');
+
+        // --- State ---
+        let top100CryptoData = [];
+        let chartInstances = {};
+        let detailedChartInstance = null;
+        let searchTimeout;
+
+        // --- Utility Functions ---
+        const formatNumber = (num) => {
+            if (num < 1 && num > 0) return `$${num.toFixed(6)}`;
+            return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(num);
+        };
+        
+        // --- API Fetching ---
+        const fetchApi = async (url) => {
+            try {
+                const response = await fetch(url);
+                if (!response.ok) throw new Error(`API Error: ${response.statusText}`);
+                return await response.json();
+            } catch (error) {
+                console.error(`Failed to fetch from ${url}:`, error);
+                loadingSpinner.style.display = 'none';
+                cryptoGrid.innerHTML = `<p class="col-span-full text-center text-red-400">Failed to load data. Please try again later.</p>`;
+                return null;
+            }
+        };
+        
+        const fetchTop100 = async () => {
+             loadingSpinner.style.display = 'flex';
+             const data = await fetchApi('https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=100&page=1&sparkline=true');
+             if (data) {
+                top100CryptoData = data;
+                renderCryptoCards(data);
+             }
+        };
+
+        const searchCoins = async (query) => {
+            loadingSpinner.style.display = 'flex';
+            cryptoGrid.innerHTML = ''; // Clear grid for search results
+            
+            const searchResults = await fetchApi(`https://api.coingecko.com/api/v3/search?query=${query}`);
+            if (searchResults && searchResults.coins.length > 0) {
+                const coinIds = searchResults.coins.slice(0, 20).map(c => c.id).join(',');
+                const data = await fetchApi(`https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=${coinIds}&order=market_cap_desc&sparkline=true`);
+                if(data) renderCryptoCards(data);
+            } else {
+                 loadingSpinner.style.display = 'none';
+                 cryptoGrid.innerHTML = `<p class="col-span-full text-center text-gray-400">No results found for "${query}"</p>`;
+            }
+        };
+
+        // --- Rendering ---
+        const renderCryptoCards = (data) => {
+            loadingSpinner.style.display = 'none';
+            cryptoGrid.innerHTML = '';
+            Object.values(chartInstances).forEach(chart => chart.destroy());
+            chartInstances = {};
+
+            if (data.length === 0) {
+                 cryptoGrid.innerHTML = `<p class="col-span-full text-center text-gray-400">No cryptocurrencies found.</p>`;
+                 return;
+            }
+
+            data.forEach((coin, index) => {
+                const priceChange = coin.price_change_percentage_24h || 0;
+                const priceChangeColor = priceChange >= 0 ? 'text-green-400' : 'text-red-400';
+                const chartColor = priceChange >= 0 ? 'rgba(60, 255, 60, 0.6)' : 'rgba(255, 60, 60, 0.6)';
+
+                const card = document.createElement('div');
+                card.className = 'glow-card rounded-xl p-4 flex flex-col justify-between transform hover:-translate-y-1 cursor-pointer card-enter-animation';
+                card.style.animationDelay = `${index * 50}ms`; // Staggered delay
+                card.dataset.coinId = coin.id;
+                
+                card.innerHTML = `
+                    <div>
+                        <div class="flex items-center mb-3">
+                            <img src="${coin.image}" alt="${coin.name}" class="w-10 h-10 mr-3 rounded-full flex-shrink-0">
+                            <div class="min-w-0">
+                                <h2 class="text-lg font-bold truncate">${coin.name}</h2>
+                                <p class="text-sm text-gray-400 uppercase">${coin.symbol}</p>
+                            </div>
+                        </div>
+                        <div class="text-xl font-semibold mb-1">${formatNumber(coin.current_price)}</div>
+                        <div class="flex items-center text-sm ${priceChangeColor}">${priceChange.toFixed(2)}% (24h)</div>
+                    </div>
+                    <div class="mt-4 h-16"><canvas id="chart-${coin.id}"></canvas></div>
+                `;
+                cryptoGrid.appendChild(card);
+                
+                // Render sparkline chart
+                if (coin.sparkline_in_7d && coin.sparkline_in_7d.price.length > 0) {
+                    const ctx = document.getElementById(`chart-${coin.id}`).getContext('2d');
+                    chartInstances[coin.id] = new Chart(ctx, {
+                        type: 'line',
+                        data: {
+                            labels: Array(coin.sparkline_in_7d.price.length).fill(''),
+                            datasets: [{
+                                data: coin.sparkline_in_7d.price,
+                                borderColor: chartColor,
+                                borderWidth: 2,
+                                pointRadius: 0,
+                                tension: 0.4
+                            }]
+                        },
+                        options: {
+                           responsive: true, maintainAspectRatio: false,
+                           plugins: { legend: { display: false }, tooltip: { enabled: false } },
+                           scales: { x: { display: false }, y: { display: false } }
+                        }
+                    });
+                }
+            });
+        };
+
+        const renderModal = async (coinId) => {
+            // Find coin data from cached list or fetch if not available
+            let coinData = top100CryptoData.find(c => c.id === coinId);
+            if (!coinData) {
+                const data = await fetchApi(`https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=${coinId}&sparkline=false`);
+                if(data && data.length > 0) coinData = data[0]; else { console.error("Could not fetch modal data"); return; }
+            }
+            const coin = coinData; // Use a new variable to avoid confusion
+            
+            const priceChange = coin.price_change_percentage_24h || 0;
+            const priceChangeColor = priceChange >= 0 ? 'text-green-400' : 'text-red-400';
+            const chartColor = priceChange >= 0 ? '#3dff3d' : '#ff2d2d';
+            
+            modalBody.innerHTML = `
+                <div class="flex items-center mb-4">
+                     <img src="${coin.image}" alt="${coin.name}" class="w-12 h-12 mr-4 rounded-full">
+                     <div>
+                         <h2 class="text-2xl font-bold">${coin.name} <span class="text-lg text-gray-400 uppercase">${coin.symbol}</span></h2>
+                         <p class="text-3xl font-semibold">${formatNumber(coin.current_price)} <span class="${priceChangeColor} text-lg">${priceChange.toFixed(2)}%</span></p>
+                     </div>
+                </div>
+                <div class="h-64 md:h-80 my-4"><canvas id="detailed-chart"></canvas></div>
+                <div class="grid grid-cols-2 gap-4 text-sm">
+                    <div><p class="text-gray-400">Market Cap</p><p class="font-semibold">${formatNumber(coin.market_cap)}</p></div>
+                    <div><p class="text-gray-400">Market Cap Rank</p><p class="font-semibold">#${coin.market_cap_rank}</p></div>
+                    <div><p class="text-gray-400">24h High</p><p class="font-semibold">${formatNumber(coin.high_24h)}</p></div>
+                    <div><p class="text-gray-400">24h Low</p><p class="font-semibold">${formatNumber(coin.low_24h)}</p></div>
+                    <div><p class="text-gray-400">Total Volume</p><p class="font-semibold">${formatNumber(coin.total_volume)}</p></div>
+                    <div><p class="text-gray-400">Circulating Supply</p><p class="font-semibold">${coin.circulating_supply.toLocaleString()}</p></div>
+                </div>
+            `;
+            modalContainer.classList.remove('hidden');
+
+            // Fetch and render detailed chart
+            const chartData = await fetchApi(`https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=7`);
+            if (chartData && chartData.prices) {
+                const ctx = document.getElementById('detailed-chart').getContext('2d');
+                if (detailedChartInstance) detailedChartInstance.destroy();
+                detailedChartInstance = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: chartData.prices.map(p => new Date(p[0]).toLocaleDateString()),
+                        datasets: [{
+                            label: 'Price (USD)',
+                            data: chartData.prices.map(p => p[1]),
+                            borderColor: chartColor,
+                            backgroundColor: 'rgba(255,255,255,0.05)',
+                            fill: true,
+                            borderWidth: 2,
+                            pointRadius: 0,
+                            tension: 0.4
+                        }]
+                    },
+                    options: {
+                        responsive: true, maintainAspectRatio: false,
+                        scales: { y: { ticks: { color: '#9CA3AF' } }, x: { ticks: { color: '#9CA3AF' } } },
+                        plugins: { legend: { display: false } }
+                    }
+                });
+            }
+        };
+
+        // --- Event Listeners ---
+        searchInput.addEventListener('input', (e) => {
+            clearTimeout(searchTimeout);
+            const searchTerm = e.target.value.trim().toLowerCase();
+            if (searchTerm) {
+                searchTimeout = setTimeout(() => searchCoins(searchTerm), 500);
+            } else {
+                renderCryptoCards(top100CryptoData); // Revert to top 100 if search is cleared
+            }
+        });
+
+        cryptoGrid.addEventListener('click', (e) => {
+            const card = e.target.closest('.glow-card');
+            if (card && card.dataset.coinId) {
+                renderModal(card.dataset.coinId);
+            }
+        });
+
+        modalClose.addEventListener('click', () => modalContainer.classList.add('hidden'));
+        modalContainer.addEventListener('click', (e) => {
+            if (e.target === modalContainer) modalContainer.classList.add('hidden');
+        });
+
+        // --- Initial Load ---
+        fetchTop100();
+        setInterval(fetchTop100, 120000); // Update top 100 every 2 minutes
+    </script>
+</body>
+</html>
