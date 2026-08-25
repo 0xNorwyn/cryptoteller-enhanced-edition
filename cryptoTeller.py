@@ -5,9 +5,17 @@ import requests
 import time
 import uuid
 from constants import (
-    HELP_PAGES, COOLDOWN_TIME_CRYPTO, CURRENCY_PAGES, SUPPORTED_CURRENCIES, CRYPTO_SYMBOLS, CMC_API_KEYS, TON_ADDRESS_REGEX
+    HELP_PAGES, COOLDOWN_TIME_CRYPTO, COOLDOWN_TIME_TOP, COOLDOWN_TIME_FGI, CURRENCY_PAGES,
+    SUPPORTED_CURRENCIES, CRYPTO_SYMBOLS, CMC_API_KEYS, TON_ADDRESS_REGEX, TOP_DEFAULT_LIMIT,
+    TOP_MAX_LIMIT, DEV_USER_IDS
 )
-from crypto_api import get_crypto_prices, current_api_key_index, get_currency_rate, get_ton_token_info
+import crypto_api
+from crypto_api import (
+    get_crypto_prices, get_ton_token_info, get_top_cryptocurrencies, get_fear_greed_index,
+    convert_currency, format_price, format_large_number
+)
+from alerts import is_triggered, start_alert_watcher
+import storage
 import re
 
 # Load environment variables
@@ -32,7 +40,7 @@ def create_help_markup():
     markup = types.InlineKeyboardMarkup()
     buttons = [
         types.InlineKeyboardButton(f"{i}️⃣", callback_data=f"help_page_{i}")
-        for i in range(1, 4)
+        for i in range(1, len(HELP_PAGES) + 1)
     ]
     return markup.row(*buttons)
 
@@ -81,7 +89,11 @@ def get_crypto_price(message):
                 sent_message = bot.send_message(chat_id, message_text_page1, parse_mode='Markdown', disable_web_page_preview=True, reply_markup=markup)
 
                 if chat_id in last_sent_message_ids:
-                    bot.delete_message(chat_id, last_sent_message_ids[chat_id])
+                    try:
+                        bot.delete_message(chat_id, last_sent_message_ids[chat_id])
+                    except Exception as e:
+                        # An old message may already be gone or too old to delete
+                        print(f"Could not delete previous price message: {e}")
                 last_sent_message_ids[chat_id] = sent_message.message_id
             except requests.exceptions.RequestException as e:
                 print(e)
@@ -104,7 +116,7 @@ def format_price_message(data):
         try:
             price = values["price"]
             change_24h = values["percent_change_24h"]
-            message_lines.append(f"• *${symbol}*:  {price:.6f}_$_ *({change_24h:.2f}%)*")
+            message_lines.append(f"• *${symbol}*:  {format_price(price)}_$_ *({change_24h:+.2f}%)*")
         except (TypeError, KeyError) as e:
             # If there's a formatting issue or missing data, skip or provide a fallback
             message_lines.append(f"• *${symbol}*:  Data not available")
@@ -126,14 +138,14 @@ def create_pagination_keyboard(current_page):
     markup.row(left_button, page_button, right_button)
     return markup
 
-@bot.callback_query_handler(func=lambda call: call.data in ["prev_page", "next_page", "page_1", "page_2", "page_3"])
+@bot.callback_query_handler(func=lambda call: call.data in ("prev_page", "next_page") or re.fullmatch(r"page_\d+", call.data))
 def handle_pagination(call):
     """Handles pagination for cryptocurrency prices."""
     chat_id = call.message.chat.id
     message_id = call.message.message_id
 
-    # Extract the current page number from the call data
-    current_page = int(call.message.reply_markup.keyboard[0][1].text[0]) - 1
+    # The page button is labelled like "2️⃣", so keep the digits only
+    current_page = int(re.sub(r"\D", "", call.message.reply_markup.keyboard[0][1].text) or 1) - 1
 
     if call.data == "prev_page":
         page = max(0, current_page - 1)
@@ -149,14 +161,16 @@ def handle_pagination(call):
 
 @bot.message_handler(commands=["api"])
 def get_current_key(message):
-    """Displays the currently used API key."""
+    """Displays the currently used API key (restricted when DEV_USER_IDS is set)."""
+    if not is_developer(message.from_user.id):
+        return
     try:
         key_names = ["ALPHA", "BRAVO", "CHARLIE", "DELTA", "ECHO", "FOXTROT", "GOLF"]
 
-        # Check if current_api_key_index is within the range of available keys
-        if 0 <= current_api_key_index < len(CMC_API_KEYS):
-            current_key_name = key_names[current_api_key_index] if current_api_key_index < len(key_names) else f"KEY {current_api_key_index + 1}"
-            bot.send_message(message.chat.id, f"*Current API Key:* {current_key_name} (#{current_api_key_index + 1})", parse_mode='Markdown')
+        # Check if the rotating key index is within the range of available keys
+        if 0 <= crypto_api.current_api_key_index < len(CMC_API_KEYS):
+            current_key_name = key_names[crypto_api.current_api_key_index] if crypto_api.current_api_key_index < len(key_names) else f"KEY {crypto_api.current_api_key_index + 1}"
+            bot.send_message(message.chat.id, f"*Current API Key:* {current_key_name} (#{crypto_api.current_api_key_index + 1})", parse_mode='Markdown')
         else:
             bot.send_message(message.chat.id, "Error: API key index is out of range.", parse_mode='Markdown')
     except Exception as e:
@@ -171,114 +185,515 @@ def share_dev_channel(message):
     except:
         bot.send_message(message.chat.id, "`Error: Could not access desired function.`", parse_mode='Markdown')
 
+# --- Shared helpers ----------------------------------------------------------
+
+def escape_markdown(text):
+    """Escapes characters Telegram's legacy Markdown would treat as formatting."""
+    return re.sub(r"([_*`\[\]])", r"\\\1", str(text))
+
+
+def cooldown_remaining(bucket, chat_id, cooldown):
+    """Returns how many seconds are left before a command may run again."""
+    last_used = bucket.get(chat_id)
+    if last_used is None:
+        return 0
+    return max(0, cooldown - (time.time() - last_used))
+
+
+def format_cooldown_text(remaining):
+    """Builds the 'command on cooldown' notice."""
+    minutes = int(remaining // 60)
+    seconds = int(remaining % 60)
+    if minutes:
+        return f"*Command on cooldown.* Try again in *{minutes}* min *{seconds}* sec"
+    return f"*Command on cooldown.* Try again in *{seconds}* sec"
+
+
+def command_argument(message):
+    """Returns everything after the command itself, or an empty string."""
+    parts = message.text.split(maxsplit=1)
+    return parts[1].strip() if len(parts) > 1 else ""
+
+
+def is_developer(user_id):
+    """An empty DEV_USER_IDS list keeps developer commands open to everyone."""
+    return not DEV_USER_IDS or user_id in DEV_USER_IDS
+
+
+# --- Top coins by market cap -------------------------------------------------
+
+last_top_time = {}
+
+@bot.message_handler(commands=["top"])
+def handle_top(message):
+    """Displays the highest ranked cryptocurrencies by market cap."""
+    chat_id = str(message.chat.id)
+    remaining = cooldown_remaining(last_top_time, chat_id, COOLDOWN_TIME_TOP)
+    if remaining:
+        bot.reply_to(message, format_cooldown_text(remaining), parse_mode='Markdown')
+        return
+
+    limit = TOP_DEFAULT_LIMIT
+    argument = command_argument(message)
+    if argument:
+        try:
+            limit = int(argument.split()[0])
+        except ValueError:
+            bot.reply_to(message, f"*Usage:* `/top [1-{TOP_MAX_LIMIT}]`", parse_mode='Markdown')
+            return
+
+    coins = get_top_cryptocurrencies(limit)
+    if not coins:
+        bot.reply_to(message, "⚠️ Could not fetch market data. Please try again later.", parse_mode='Markdown')
+        return
+
+    last_top_time[chat_id] = time.time()
+    lines = []
+    for coin in coins:
+        change_24h = coin["percent_change_24h"]
+        trend = "🟢" if change_24h >= 0 else "🔴"
+        lines.append(
+            f"`{coin['rank']:>2}.` {trend} *${escape_markdown(coin['symbol'])}* — "
+            f"{format_price(coin['price'])}_$_ *({change_24h:+.2f}%)*  ∙  MC ${format_large_number(coin['market_cap'])}"
+        )
+
+    message_text = (
+        f"🏆 *Top {len(coins)} by market cap*\n\n"
+        + "\n".join(lines)
+        + "\n\n  ∟  Prices from: *CoinMarketCap*"
+    )
+    bot.send_message(message.chat.id, message_text, parse_mode='Markdown', disable_web_page_preview=True)
+
+
+# --- Fear & Greed index ------------------------------------------------------
+
+last_fgi_time = {}
+
+@bot.message_handler(commands=["fgi", "feargreed"])
+def handle_fear_greed(message):
+    """Displays the Crypto Fear & Greed Index."""
+    chat_id = str(message.chat.id)
+    remaining = cooldown_remaining(last_fgi_time, chat_id, COOLDOWN_TIME_FGI)
+    if remaining:
+        bot.reply_to(message, format_cooldown_text(remaining), parse_mode='Markdown')
+        return
+
+    index = get_fear_greed_index()
+    if not index:
+        bot.reply_to(message, "⚠️ Could not fetch the Fear & Greed Index. Please try again later.", parse_mode='Markdown')
+        return
+
+    last_fgi_time[chat_id] = time.time()
+    value = max(0, min(100, index["value"]))
+    if value < 25:
+        mood_emoji = "😱"
+    elif value < 45:
+        mood_emoji = "😨"
+    elif value <= 55:
+        mood_emoji = "😐"
+    elif value <= 75:
+        mood_emoji = "🙂"
+    else:
+        mood_emoji = "🤑"
+
+    filled = round(value / 10)
+    gauge = "█" * filled + "░" * (10 - filled)
+    message_text = (
+        f"{mood_emoji} *Crypto Fear & Greed Index*\n\n"
+        f"`{gauge}`  *{value}/100*\n"
+        f"Market mood: *{escape_markdown(index['classification'])}*\n\n"
+        f"_Updated: {index['updated'].strftime('%Y-%m-%d %H:%M UTC')}_\n"
+        f"  ∟  Data from: *alternative.me*"
+    )
+    bot.send_message(message.chat.id, message_text, parse_mode='Markdown', disable_web_page_preview=True)
+
+
+# --- Currency conversion -----------------------------------------------------
+
+CONVERSION_REGEX = re.compile(r"^(?:(\d*\.?\d+)\s+)?([A-Z]{3,5})\s+(?:TO\s+)?([A-Z]{3,5})$")
+
+
+def parse_conversion_query(text):
+    """Parses '[amount] CUR1 [to] CUR2'. Returns (amount, from, to) or None."""
+    normalized = " ".join(text.strip().upper().replace(",", ".").split())
+    match = CONVERSION_REGEX.match(normalized)
+    if not match:
+        return None
+
+    amount_str, from_currency, to_currency = match.groups()
+    try:
+        amount = float(amount_str) if amount_str else 1.0
+    except ValueError:
+        return None
+    return amount, from_currency, to_currency
+
+
+def format_currency_amount(amount, currency):
+    """Formats an amount with the icon and precision matching its currency."""
+    if currency in CRYPTO_SYMBOLS:
+        return f"🪙 {amount:,.6f} ${currency}"
+    return f"💸 {amount:,.2f} {currency}"
+
+
+def build_conversion_text(query):
+    """Turns a raw conversion query into a result line.
+
+    Returns:
+        tuple: (result text, None) on success, or (None, error message).
+    """
+    parsed = parse_conversion_query(query)
+    if not parsed:
+        return None, "Invalid format. Use: [amount] CUR1 [to] CUR2"
+
+    amount, from_currency, to_currency = parsed
+    for currency in (from_currency, to_currency):
+        if currency not in SUPPORTED_CURRENCIES:
+            return None, f"Unsupported currency: {currency}"
+
+    converted, error = convert_currency(amount, from_currency, to_currency)
+    if error:
+        return None, error
+    return (
+        f"{format_currency_amount(amount, from_currency)} = "
+        f"{format_currency_amount(converted, to_currency)}"
+    ), None
+
+
+@bot.message_handler(commands=["convert"])
+def handle_convert(message):
+    """Converts currencies straight in the chat (same syntax as the inline mode)."""
+    query = command_argument(message)
+    if not query:
+        bot.reply_to(
+            message,
+            "*Usage:* `/convert 100 USD BTC`\n"
+            "Also works inline: `@crypteller_bot 100 USD BTC`",
+            parse_mode='Markdown'
+        )
+        return
+
+    result_text, error_message = build_conversion_text(query)
+    bot.reply_to(message, result_text or f"⚠️ {error_message}", parse_mode='Markdown')
+
+
+# --- Price alerts ------------------------------------------------------------
+
+ALERT_REGEX = re.compile(r"^([A-Za-z]{2,10})(>=|<=|>|<|=)?([0-9]*\.?[0-9]+)$")
+
+ALERT_USAGE = (
+    "*Usage:*\n"
+    "• `/alert BTC > 100000` - fires when the price rises above\n"
+    "• `/alert TON < 4` - fires when the price drops below\n"
+    "• `/alert SOL 250` - direction is picked automatically\n\n"
+    "`/alerts` lists them, `/delalert <id>` removes one."
+)
+
+
+@bot.message_handler(commands=["alert"])
+def handle_alert(message):
+    """Creates a price alert that fires in the current chat."""
+    argument = command_argument(message)
+    if not argument:
+        bot.reply_to(message, ALERT_USAGE, parse_mode='Markdown')
+        return
+
+    match = ALERT_REGEX.match(argument.replace(" ", "").replace(",", "."))
+    if not match:
+        bot.reply_to(message, ALERT_USAGE, parse_mode='Markdown')
+        return
+
+    symbol = match.group(1).upper()
+    operator = match.group(2)
+    try:
+        target = float(match.group(3))
+    except ValueError:
+        bot.reply_to(message, ALERT_USAGE, parse_mode='Markdown')
+        return
+
+    if target <= 0:
+        bot.reply_to(message, "⚠️ The target price must be greater than zero.", parse_mode='Markdown')
+        return
+
+    price_data = get_crypto_prices([symbol]).get(symbol)
+    if not price_data or price_data.get("price") is None:
+        bot.reply_to(message, f"⚠️ Unknown or unsupported coin: *${escape_markdown(symbol)}*", parse_mode='Markdown')
+        return
+
+    current_price = price_data["price"]
+    if operator in (">", ">="):
+        direction = "above"
+    elif operator in ("<", "<="):
+        direction = "below"
+    else:
+        # No operator given: watch the side the price has yet to reach.
+        direction = "above" if target > current_price else "below"
+
+    if is_triggered({"direction": direction, "target": target}, current_price):
+        bot.reply_to(
+            message,
+            f"⚠️ That condition is already met — *${escape_markdown(symbol)}* is at "
+            f"*{format_price(current_price)}_$_* right now.",
+            parse_mode='Markdown'
+        )
+        return
+
+    alert, error_message = storage.add_alert(
+        chat_id=message.chat.id,
+        user_id=message.from_user.id,
+        username=message.from_user.username,
+        first_name=message.from_user.first_name,
+        symbol=symbol,
+        direction=direction,
+        target=target,
+    )
+    if error_message:
+        bot.reply_to(message, f"⚠️ {error_message}", parse_mode='Markdown')
+        return
+
+    condition = "📈 rises above" if direction == "above" else "📉 drops below"
+    bot.reply_to(
+        message,
+        f"🔔 Alert `{alert['id']}` created.\n\n"
+        f"I'll ping you here when *${escape_markdown(symbol)}* {condition} "
+        f"*{format_price(target)}_$_*.\n"
+        f"Current price: *{format_price(current_price)}_$_*",
+        parse_mode='Markdown'
+    )
+
+
+@bot.message_handler(commands=["alerts"])
+def handle_alerts_list(message):
+    """Lists the alerts a user has in the current chat."""
+    user_alerts = storage.get_user_alerts(message.chat.id, message.from_user.id)
+    if not user_alerts:
+        bot.reply_to(
+            message,
+            "You have no active alerts here.\nCreate one with `/alert BTC > 100000`",
+            parse_mode='Markdown'
+        )
+        return
+
+    lines = []
+    for alert in user_alerts:
+        sign = "≥" if alert["direction"] == "above" else "≤"
+        lines.append(
+            f"• `{alert['id']}` — *${escape_markdown(alert['symbol'])}* {sign} "
+            f"*{format_price(alert['target'])}_$_*"
+        )
+
+    bot.reply_to(
+        message,
+        "🔔 *Your active alerts*\n\n" + "\n".join(lines) + "\n\n_Remove one with_ `/delalert <id>`",
+        parse_mode='Markdown'
+    )
+
+
+@bot.message_handler(commands=["delalert"])
+def handle_delete_alert(message):
+    """Removes one alert, or all of them."""
+    argument = command_argument(message)
+    alert_id = argument.split()[0].lower() if argument else ""
+    if not alert_id:
+        bot.reply_to(message, "*Usage:* `/delalert <id>` or `/delalert all`", parse_mode='Markdown')
+        return
+
+    if alert_id == "all":
+        removed = storage.remove_user_alerts(message.chat.id, message.from_user.id)
+        if removed:
+            bot.reply_to(message, f"🗑 Removed *{removed}* alert(s).", parse_mode='Markdown')
+        else:
+            bot.reply_to(message, "You have no active alerts here.", parse_mode='Markdown')
+        return
+
+    if storage.remove_alert(message.chat.id, message.from_user.id, alert_id):
+        bot.reply_to(message, f"🗑 Alert `{alert_id}` removed.", parse_mode='Markdown')
+    else:
+        bot.reply_to(message, f"⚠️ No alert `{escape_markdown(alert_id)}` of yours found here.", parse_mode='Markdown')
+
+
+def notify_alert(alert, price):
+    """Sends a fired alert back to the chat it was created in."""
+    if alert.get("username"):
+        mention = f"@{escape_markdown(alert['username'])}"
+    else:
+        # Users without a @username still get a tappable mention
+        name = escape_markdown(alert.get("first_name") or "trader")
+        mention = f"[{name}](tg://user?id={alert['user_id']})"
+    condition = "rose above" if alert["direction"] == "above" else "dropped below"
+    trend = "📈" if alert["direction"] == "above" else "📉"
+    bot.send_message(
+        alert["chat_id"],
+        f"{trend} *Price alert* — {mention}\n\n"
+        f"*${escape_markdown(alert['symbol'])}* {condition} *{format_price(alert['target'])}_$_*\n"
+        f"Current price: *{format_price(price)}_$_*\n\n"
+        f"_Alert_ `{alert['id']}` _has been removed._",
+        parse_mode='Markdown'
+    )
+
+
+# --- Portfolio ---------------------------------------------------------------
+
+PORTFOLIO_USAGE = (
+    "*Usage:*\n"
+    "• `/portfolio` - shows your holdings\n"
+    "• `/portfolio add BTC 0.5` - adds or updates a coin\n"
+    "• `/portfolio add BTC 0.5 60000` - also stores the buy price\n"
+    "• `/portfolio remove BTC` - drops a coin\n"
+    "• `/portfolio clear` - wipes everything"
+)
+
+
+def parse_number(raw):
+    """Parses a user supplied number, accepting both '1.5' and '1,5'."""
+    try:
+        return float(raw.replace(",", "."))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def send_portfolio(message):
+    """Renders the user's holdings with current value, 24h change and P/L."""
+    holdings = storage.get_portfolio(message.from_user.id)
+    if not holdings:
+        bot.reply_to(
+            message,
+            "💼 Your portfolio is empty.\n\nAdd a coin with `/portfolio add BTC 0.5`",
+            parse_mode='Markdown'
+        )
+        return
+
+    symbols = sorted(holdings)
+    prices = get_crypto_prices(symbols)
+
+    lines = []
+    total_value = 0.0
+    value_24h_ago = 0.0
+    invested_value = 0.0
+    invested_now = 0.0
+
+    for symbol in symbols:
+        entry = holdings[symbol]
+        amount = entry.get("amount") or 0.0
+        price_data = prices.get(symbol)
+        if not price_data or price_data.get("price") is None:
+            lines.append(f"• *${escape_markdown(symbol)}* — {amount:,.6f} _(price unavailable)_")
+            continue
+
+        price = price_data["price"]
+        change_24h = price_data.get("percent_change_24h") or 0.0
+        value = amount * price
+        total_value += value
+
+        # Reconstruct yesterday's value so the total change stays weighted.
+        divisor = 1 + change_24h / 100
+        value_24h_ago += value / divisor if divisor > 0 else value
+
+        trend = "🟢" if change_24h >= 0 else "🔴"
+        line = (
+            f"• {trend} *${escape_markdown(symbol)}* — {amount:,.6f} ≈ *${value:,.2f}* "
+            f"*({change_24h:+.2f}%)*"
+        )
+
+        buy_price = entry.get("buy_price")
+        if buy_price:
+            invested_value += amount * buy_price
+            invested_now += value
+            pnl_percent = (price / buy_price - 1) * 100
+            line += f"\n   ∟ buy {format_price(buy_price)}_$_ → P/L *{pnl_percent:+.2f}%*"
+        lines.append(line)
+
+    summary = [f"💰 *Total: ${total_value:,.2f}*"]
+    if value_24h_ago > 0:
+        total_change = (total_value / value_24h_ago - 1) * 100
+        summary[0] += f" *({total_change:+.2f}% / 24h)*"
+    if invested_value > 0:
+        pnl_percent = (invested_now / invested_value - 1) * 100
+        summary.append(
+            f"📊 P/L on tracked buys: *{pnl_percent:+.2f}%* (${invested_now - invested_value:+,.2f})"
+        )
+
+    bot.reply_to(
+        message,
+        "💼 *Your portfolio*\n\n" + "\n".join(lines) + "\n\n" + "\n".join(summary),
+        parse_mode='Markdown'
+    )
+
+
+def add_holding(message, args):
+    """Handles '/portfolio add SYMBOL AMOUNT [BUY_PRICE]'."""
+    if len(args) < 2:
+        bot.reply_to(message, PORTFOLIO_USAGE, parse_mode='Markdown')
+        return
+
+    symbol = args[0].upper()
+    amount = parse_number(args[1])
+    if amount is None or amount <= 0:
+        bot.reply_to(message, "⚠️ The amount must be a positive number.", parse_mode='Markdown')
+        return
+
+    buy_price = None
+    if len(args) > 2:
+        buy_price = parse_number(args[2])
+        if buy_price is None or buy_price <= 0:
+            bot.reply_to(message, "⚠️ The buy price must be a positive number.", parse_mode='Markdown')
+            return
+
+    price_data = get_crypto_prices([symbol]).get(symbol)
+    if not price_data or price_data.get("price") is None:
+        bot.reply_to(message, f"⚠️ Unknown or unsupported coin: *${escape_markdown(symbol)}*", parse_mode='Markdown')
+        return
+
+    saved, error_message = storage.set_holding(message.from_user.id, symbol, amount, buy_price)
+    if not saved:
+        bot.reply_to(message, f"⚠️ {error_message}", parse_mode='Markdown')
+        return
+
+    value = amount * price_data["price"]
+    bot.reply_to(
+        message,
+        f"✅ Saved *{amount:,.6f} ${escape_markdown(symbol)}* ≈ *${value:,.2f}*\n"
+        f"_See everything with_ `/portfolio`",
+        parse_mode='Markdown'
+    )
+
+
+@bot.message_handler(commands=["portfolio"])
+def handle_portfolio(message):
+    """Entry point for every portfolio sub-command."""
+    args = message.text.split()[1:]
+    action = args[0].lower() if args else "show"
+
+    if action in ("add", "set"):
+        add_holding(message, args[1:])
+    elif action in ("remove", "rm", "del", "delete"):
+        if len(args) < 2:
+            bot.reply_to(message, "*Usage:* `/portfolio remove BTC`", parse_mode='Markdown')
+            return
+        symbol = args[1].upper()
+        if storage.remove_holding(message.from_user.id, symbol):
+            bot.reply_to(message, f"🗑 Removed *${escape_markdown(symbol)}* from your portfolio.", parse_mode='Markdown')
+        else:
+            bot.reply_to(message, f"⚠️ *${escape_markdown(symbol)}* is not in your portfolio.", parse_mode='Markdown')
+    elif action == "clear":
+        removed = storage.clear_portfolio(message.from_user.id)
+        if removed:
+            bot.reply_to(message, f"🗑 Portfolio cleared (*{removed}* coin(s) removed).", parse_mode='Markdown')
+        else:
+            bot.reply_to(message, "💼 Your portfolio is already empty.", parse_mode='Markdown')
+    elif action == "help":
+        bot.reply_to(message, PORTFOLIO_USAGE, parse_mode='Markdown')
+    elif action == "show":
+        send_portfolio(message)
+    else:
+        bot.reply_to(message, PORTFOLIO_USAGE, parse_mode='Markdown')
+
+
 @bot.inline_handler(lambda query: len(query.query) > 0)
 def handle_inline_query(inline_query):
     """Handles inline queries for currency and cryptocurrency conversions."""
     try:
-        user_input = inline_query.query.strip().upper()
-        # Regex to parse input: optional amount, currency1, optional 'to', currency2
-        match = re.match(r"^(?:(\d*\.?\d+)\s)?([A-Z]{3,5})\s(?:TO\s)?([A-Z]{3,5})$", user_input)
+        result_text, error_message = build_conversion_text(inline_query.query)
 
-        if not match:
-            # Try parsing just two currencies (amount defaults to 1)
-            match_simple = re.match(r"^([A-Z]{3,5})\s(?:TO\s)?([A-Z]{3,5})$", user_input)
-            if match_simple:
-                amount = 1.0
-                from_currency = match_simple.group(1)
-                to_currency = match_simple.group(2)
-            else:
-                bot.answer_inline_query(inline_query.id, [], switch_pm_text="Invalid format. Use: [amount] CUR1 [to] CUR2")
-                return
-        else:
-            amount_str, from_currency, to_currency = match.groups()
-            amount = float(amount_str) if amount_str else 1.0
-
-        # Validate currencies
-        if from_currency not in SUPPORTED_CURRENCIES:
-            bot.answer_inline_query(inline_query.id, [], switch_pm_text=f"Unsupported currency: {from_currency}")
-            return
-        if to_currency not in SUPPORTED_CURRENCIES:
-            bot.answer_inline_query(inline_query.id, [], switch_pm_text=f"Unsupported currency: {to_currency}")
-            return
-
-        is_from_crypto = from_currency in CRYPTO_SYMBOLS
-        is_to_crypto = to_currency in CRYPTO_SYMBOLS
-
-        result_text = ""
-        error_message = None
-
-        # Case 1: Fiat to Fiat
-        if not is_from_crypto and not is_to_crypto:
-            rate = get_currency_rate(from_currency, to_currency)
-            if rate is not None:
-                converted_amount = amount * rate
-                result_text = f"💸 {amount:,.2f} {from_currency} = 💸 {converted_amount:,.2f} {to_currency}"
-            else:
-                error_message = f"Could not get rate for {from_currency}/{to_currency}."
-
-        # Case 2: Crypto to Fiat
-        elif is_from_crypto and not is_to_crypto:
-            crypto_data = get_crypto_prices([from_currency])
-            crypto_price_usd_data = crypto_data.get(from_currency)
-
-            if crypto_price_usd_data and 'price' in crypto_price_usd_data:
-                crypto_price_usd = crypto_price_usd_data['price']
-                if to_currency == "USD":
-                    converted_amount = amount * crypto_price_usd
-                    result_text = f"🪙 {amount:,.4f} ${from_currency} = 💸 {converted_amount:,.2f} {to_currency}"
-                else:
-                    usd_to_fiat_rate = get_currency_rate("USD", to_currency)
-                    if usd_to_fiat_rate is not None:
-                        converted_amount = amount * crypto_price_usd * usd_to_fiat_rate
-                        result_text = f"🪙 {amount:,.4f} ${from_currency} = 💸 {converted_amount:,.2f} {to_currency}"
-                    else:
-                        error_message = f"Could not get rate for USD/{to_currency}."
-            else:
-                error_message = f"Could not get price for ${from_currency}."
-
-        # Case 3: Fiat to Crypto
-        elif not is_from_crypto and is_to_crypto:
-            crypto_data = get_crypto_prices([to_currency])
-            crypto_price_usd_data = crypto_data.get(to_currency)
-
-            if crypto_price_usd_data and 'price' in crypto_price_usd_data:
-                crypto_price_usd = crypto_price_usd_data['price']
-                if from_currency == "USD":
-                    converted_amount = amount / crypto_price_usd
-                    result_text = f"💸 {amount:,.2f} {from_currency} = 🪙 {converted_amount:,.6f} ${to_currency}"
-                else:
-                    fiat_to_usd_rate = get_currency_rate(from_currency, "USD")
-                    if fiat_to_usd_rate is not None:
-                        converted_amount = (amount * fiat_to_usd_rate) / crypto_price_usd
-                        result_text = f"💸 {amount:,.2f} {from_currency} = 🪙 {converted_amount:,.6f} ${to_currency}"
-                    else:
-                        error_message = f"Could not get rate for {from_currency}/USD."
-            else:
-                error_message = f"Could not get price for ${to_currency}."
-
-        # Case 4: Crypto to Crypto
-        elif is_from_crypto and is_to_crypto:
-            crypto_data = get_crypto_prices([from_currency, to_currency])
-            from_price_data = crypto_data.get(from_currency)
-            to_price_data = crypto_data.get(to_currency)
-
-            if from_price_data and 'price' in from_price_data and to_price_data and 'price' in to_price_data:
-                from_price_usd = from_price_data['price']
-                to_price_usd = to_price_data['price']
-                if to_price_usd > 0: # Avoid division by zero
-                    converted_amount = amount * (from_price_usd / to_price_usd)
-                    result_text = f"🪙 {amount:,.4f} ${from_currency} = 🪙 {converted_amount:,.6f} ${to_currency}"
-                else:
-                    error_message = f"Price for ${to_currency} is zero."
-            else:
-                missing = []
-                if not (from_price_data and 'price' in from_price_data):
-                    missing.append(from_currency)
-                if not (to_price_data and 'price' in to_price_data):
-                    missing.append(to_currency)
-                error_message = f"Could not get price for ${' and '.join(missing)}."
-
-        # Send result or error
         if result_text:
             result = types.InlineQueryResultArticle(
                 id=str(uuid.uuid4()),
@@ -322,4 +737,5 @@ def handle_contract_address(message):
 # Start polling
 if __name__ == "__main__":
     print("Bot is running...")
+    start_alert_watcher(notify_alert)
     bot.polling(none_stop=True)

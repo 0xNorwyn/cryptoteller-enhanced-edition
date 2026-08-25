@@ -1,6 +1,10 @@
+import time
 import requests
 from datetime import datetime, timezone, timedelta
-from constants import CMC_API_KEYS, EXCHANGE_RATE_API_KEYS, DEXSCREENER_API_URL
+from constants import (
+    CMC_API_KEYS, EXCHANGE_RATE_API_KEYS, DEXSCREENER_API_URL, CMC_QUOTES_URL,
+    CMC_LISTINGS_URL, FEAR_GREED_API_URL, TOP_DEFAULT_LIMIT, TOP_MAX_LIMIT, CRYPTO_SYMBOLS
+)
 
 # Global variables for API key rotation
 current_api_key_index = 0
@@ -41,11 +45,14 @@ def get_crypto_prices(symbols):
 
     # Fetch missing symbols
     if symbols_to_fetch:
-        url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
+        url = CMC_QUOTES_URL
         params = {"symbol": ",".join(symbols_to_fetch), "convert": "USD"}
         headers = {"X-CMC_PRO_API_KEY": CMC_API_KEYS[current_api_key_index]}
 
-        while True:
+        attempts = 0
+        max_attempts = max(3, len(CMC_API_KEYS) * 2)
+        while attempts < max_attempts:
+            attempts += 1
             try:
                 response = requests.get(url, params=params, headers=headers, timeout=10) # Added timeout
                 response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
@@ -249,11 +256,32 @@ def switch_exchange_rate_api_key():
     current_exchange_rate_api_key_index = (current_exchange_rate_api_key_index + 1) % len(EXCHANGE_RATE_API_KEYS)
 
 def format_large_number(num):
-    if num >= 1_000_000:
-        return f"{num / 1_000_000:.2f}M"
-    elif num >= 1_000:
-        return f"{num / 1_000:.1f}K"
-    return str(num)
+    """Formats big numbers in a compact way: 1.23T / 45.60B / 7.80M / 9.10K."""
+    try:
+        num = float(num)
+    except (TypeError, ValueError):
+        return "N/A"
+
+    for threshold, suffix in ((1_000_000_000_000, "T"), (1_000_000_000, "B"),
+                              (1_000_000, "M"), (1_000, "K")):
+        if abs(num) >= threshold:
+            return f"{num / threshold:.2f}{suffix}"
+    return f"{num:,.2f}"
+
+
+def format_price(value):
+    """Formats a price with a precision that suits its magnitude."""
+    if value is None:
+        return "N/A"
+    magnitude = abs(value)
+    if magnitude >= 1000:
+        return f"{value:,.2f}"
+    if magnitude >= 1:
+        return f"{value:,.4f}"
+    if magnitude >= 0.0001:
+        return f"{value:,.6f}"
+    return f"{value:.8f}"
+
 
 def calculate_age(timestamp_ms):
     if not timestamp_ms:
@@ -330,3 +358,195 @@ def get_ton_token_info(address):
     except Exception as e:
         print(f"An unexpected error occurred while processing address {address}: {e}")
         return None, "⚠️ An unexpected error occurred while processing the address."
+
+
+# Caches for the market-data helpers below
+top_cryptocurrencies_cache = {}
+TOP_CACHE_DURATION = timedelta(minutes=10)
+
+fear_greed_cache = {}
+FEAR_GREED_CACHE_DURATION = timedelta(minutes=30)
+
+
+def _cmc_get(url, params):
+    """Performs a CoinMarketCap request, rotating keys on auth/limit errors.
+
+    Args:
+        url (str): CoinMarketCap endpoint.
+        params (dict): Query parameters.
+
+    Returns:
+        dict: The parsed JSON response, or None if every key failed.
+    """
+    for _ in range(max(1, len(CMC_API_KEYS))):
+        headers = {"X-CMC_PRO_API_KEY": CMC_API_KEYS[current_api_key_index]}
+        try:
+            response = requests.get(url, params=params, headers=headers, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.HTTPError as http_err:
+            status_code = http_err.response.status_code if http_err.response is not None else None
+            if status_code in (401, 402, 429):
+                print(f"CMC key #{current_api_key_index + 1} rejected (HTTP {status_code}). Switching key.")
+                switch_api_key()
+                continue
+            print(f"CoinMarketCap request failed: {http_err}")
+            return None
+        except requests.exceptions.RequestException as e:
+            print(f"CoinMarketCap request failed: {e}")
+            time.sleep(1)
+    print("All CoinMarketCap API keys failed for this request.")
+    return None
+
+
+def get_top_cryptocurrencies(limit=TOP_DEFAULT_LIMIT, convert="USD"):
+    """Fetches the highest ranked coins by market cap, using cache if available.
+
+    Args:
+        limit (int): How many coins to return (capped at TOP_MAX_LIMIT).
+        convert (str): Fiat currency the quotes are converted to.
+
+    Returns:
+        list: Coin dicts sorted by rank, or None when the request failed.
+    """
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = TOP_DEFAULT_LIMIT
+    limit = max(1, min(limit, TOP_MAX_LIMIT))
+
+    now = datetime.now(timezone.utc)
+    cached = top_cryptocurrencies_cache.get(convert)
+    if cached and now - cached[1] < TOP_CACHE_DURATION:
+        return cached[0][:limit]
+
+    # Always request the maximum so a bigger /top does not cost another call.
+    payload = _cmc_get(CMC_LISTINGS_URL, {
+        "start": 1,
+        "limit": TOP_MAX_LIMIT,
+        "convert": convert,
+        "sort": "market_cap",
+    })
+    if not payload or not payload.get("data"):
+        return None
+
+    coins = []
+    for entry in payload["data"]:
+        quote = entry.get("quote", {}).get(convert, {})
+        if quote.get("price") is None:
+            continue
+        coins.append({
+            "rank": entry.get("cmc_rank"),
+            "symbol": entry.get("symbol", "?"),
+            "name": entry.get("name", "?"),
+            "price": quote.get("price"),
+            "percent_change_24h": quote.get("percent_change_24h") or 0.0,
+            "market_cap": quote.get("market_cap") or 0,
+            "volume_24h": quote.get("volume_24h") or 0,
+        })
+
+    if not coins:
+        return None
+
+    top_cryptocurrencies_cache[convert] = (coins, datetime.now(timezone.utc))
+    return coins[:limit]
+
+
+def get_fear_greed_index():
+    """Fetches the Crypto Fear & Greed Index (alternative.me, no API key needed).
+
+    Returns:
+        dict: {"value": int, "classification": str, "updated": datetime}, or None.
+    """
+    now = datetime.now(timezone.utc)
+    cached = fear_greed_cache.get("latest")
+    if cached and now - cached[1] < FEAR_GREED_CACHE_DURATION:
+        return cached[0]
+
+    try:
+        response = requests.get(FEAR_GREED_API_URL, timeout=10)
+        response.raise_for_status()
+        entries = response.json().get("data") or []
+        if not entries:
+            print("Fear & Greed API returned no data.")
+            return None
+
+        entry = entries[0]
+        result = {
+            "value": int(entry.get("value", 0)),
+            "classification": entry.get("value_classification", "Unknown"),
+            "updated": datetime.fromtimestamp(int(entry.get("timestamp", 0)), timezone.utc),
+        }
+        fear_greed_cache["latest"] = (result, datetime.now(timezone.utc))
+        return result
+    except (requests.exceptions.RequestException, ValueError, TypeError, KeyError) as e:
+        print(f"Error fetching Fear & Greed index: {e}")
+        return None
+
+
+def convert_currency(amount, from_currency, to_currency):
+    """Converts an amount between any supported fiat/crypto pair.
+
+    Args:
+        amount (float): Amount of from_currency.
+        from_currency (str): Source currency code.
+        to_currency (str): Target currency code.
+
+    Returns:
+        tuple: (converted amount, None) on success, or (None, error message).
+    """
+    if from_currency == to_currency:
+        return amount, None
+
+    is_from_crypto = from_currency in CRYPTO_SYMBOLS
+    is_to_crypto = to_currency in CRYPTO_SYMBOLS
+
+    # Fiat to fiat
+    if not is_from_crypto and not is_to_crypto:
+        rate = get_currency_rate(from_currency, to_currency)
+        if rate is None:
+            return None, f"Could not get rate for {from_currency}/{to_currency}."
+        return amount * rate, None
+
+    # Crypto to fiat
+    if is_from_crypto and not is_to_crypto:
+        price_data = get_crypto_prices([from_currency]).get(from_currency)
+        if not price_data or price_data.get("price") is None:
+            return None, f"Could not get price for ${from_currency}."
+        usd_value = amount * price_data["price"]
+        if to_currency == "USD":
+            return usd_value, None
+        rate = get_currency_rate("USD", to_currency)
+        if rate is None:
+            return None, f"Could not get rate for USD/{to_currency}."
+        return usd_value * rate, None
+
+    # Fiat to crypto
+    if not is_from_crypto and is_to_crypto:
+        price_data = get_crypto_prices([to_currency]).get(to_currency)
+        if not price_data or price_data.get("price") is None:
+            return None, f"Could not get price for ${to_currency}."
+        crypto_price = price_data["price"]
+        if crypto_price <= 0:
+            return None, f"Price for ${to_currency} is zero."
+        if from_currency == "USD":
+            return amount / crypto_price, None
+        rate = get_currency_rate(from_currency, "USD")
+        if rate is None:
+            return None, f"Could not get rate for {from_currency}/USD."
+        return (amount * rate) / crypto_price, None
+
+    # Crypto to crypto
+    prices = get_crypto_prices([from_currency, to_currency])
+    from_data = prices.get(from_currency)
+    to_data = prices.get(to_currency)
+    missing = []
+    if not from_data or from_data.get("price") is None:
+        missing.append(from_currency)
+    if not to_data or to_data.get("price") is None:
+        missing.append(to_currency)
+    if missing:
+        return None, f"Could not get price for ${' and $'.join(missing)}."
+    if to_data["price"] <= 0:
+        return None, f"Price for ${to_currency} is zero."
+    return amount * (from_data["price"] / to_data["price"]), None
